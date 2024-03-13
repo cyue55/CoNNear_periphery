@@ -72,7 +72,11 @@ def load_connear_model(modeldir: str, json_name: str = "/Gmodel.json",
     loaded_model_json = json_file.read()
     json_file.close()
 
+    '''这是TensorFlow提供的一个上下文管理器,用于临时注册自定义对象,使得这些对象在上下文管理器的作用域内可用。
+    这里,它注册了GlorotUniform初始化器(通过glorot_uniform()函数获得),使其在加载模型的JSON定义时可用。
+    这种做法通常用于模型定义中包含了非标准或自定义层、激活函数、初始化器等组件时。'''
     with CustomObjectScope({'GlorotUniform': glorot_uniform()}):
+        # 在这个例子中,它传递了TensorFlow库('tf': tf),这对于模型定义中可能使用到TensorFlow函数或操作的情况是必要的。
         model = model_from_json(loaded_model_json, custom_objects={'tf': tf})
     if name:
         try:
@@ -81,6 +85,11 @@ def load_connear_model(modeldir: str, json_name: str = "/Gmodel.json",
             model._name = name
     model.load_weights(modeldir + weights_name)
     
+    '''这一行检查crop参数是否为False。如果是,意味着用户想要获取模型的完整输出,而不是某个裁剪后的版本。
+    在一些情况下,模型的输出可能会经过裁剪(crop)以匹配下一个模块的输入要求,或者去除不必要的输出部分。
+    但在这个情况下,我们希望保留模型的完整输出。
+    去除了可能的输入层和不需要的最后一层。
+    '''
     if not crop: # for connecting the different modules
         model=model.layers[1]
         if name:
@@ -112,26 +121,34 @@ def build_connear(modeldir: str, poles: str = '', Ncf: int = 201, full_model: bo
       print_summary: Print the Keras summary of the model
     """
     assert(Ncf == 201 or Ncf == 21 or Ncf == 1), "Only 201-, 21- and 1-CF models are provided by the current framework for the moment."
+    # 为了后面加载文件名
     if Ncf != 201:
         cf_flag = '_' + str(Ncf) + 'cf'
     else:
         cf_flag = ''
-    # Cochlea
+    ### Cochlea ###
     poles = poles.lower() # make lowercase
+    # 加载正常听力模型文件
     if (not poles) or poles == 'nh':
         cochlea = load_connear_model(modeldir,json_name="/cochlea.json",weights_name="/cochlea.h5",name="cochlea_model",crop=0)
+    # 加载不正常听力模型文件
     else:
         assert(path.exists(modeldir + "/cochlea_" + poles + ".h5")), "The poles for the selected HI profile do not exist. HI cochlear models are available for the following hearing-loss profiles: Flat25, Flat35, Slope25, Slope35"
         cochlea = load_connear_model(modeldir,json_name="/cochlea.json",weights_name="/cochlea_" + poles + ".h5",name="cochlea_model",crop=0)
+    '''这种做法通常用于迁移学习(transfer learning)和模型微调(fine-tuning)的场景,
+    其中预训练的模型被用作固定的特征提取器,而不需要根据新的数据集进行调整。
+    在这个特定的场景中,将耳蜗模型设置为不可训练是为了利用它已经学习到的关于人类听觉外周响应的知识,而不希望这些知识被新的训练数据所改变。'''
     cochlea.trainable=False
     for l in cochlea.layers:
         l.trainable=False
-    # IHC
+
+    ### IHC ###
     ihc = load_connear_model(modeldir,json_name="/ihc" + cf_flag + ".json",weights_name="/ihc.h5",name="ihc_model",crop=0)
     ihc.trainable=False
     for l in ihc.layers:
         l.trainable=False
-    # ANF
+        
+    ### ANF ###
     anf = load_connear_model(modeldir,json_name="/anf" + cf_flag + ".json",weights_name="/anf.h5",name="anf_model")
     anf.trainable=False
     for l in anf.layers:
@@ -141,10 +158,14 @@ def build_connear(modeldir: str, poles: str = '', Ncf: int = 201, full_model: bo
         audio_in = Input(shape=(None,1), name="audio_input", dtype='float32')
         cochlea = Model(cochlea.layers[0].input,cochlea.layers[-1].output)
         cochlea_out = cochlea(audio_in)
+        '''如果中心频率数(Ncf)不等于201且大于1,意味着需要对耳蜗模型的输出进行降采样,以匹配指定的中心频率数。
+        这通过创建一个范围为0到201的数组CFs,然后使用Lambda层和tf.gather函数实现,选择性地从耳蜗输出中提取特定的频率通道。'''
         if Ncf < 201 and Ncf > 1: # downsample the frequency channels of CoNNear cochlea
             CFs = K.arange(0,201,int((201-1)/(Ncf-1)))
             cochlea_out=Lambda(lambda x: tf.gather(x,CFs,axis=2), name='freq_downsampling')(cochlea_out)
+        # 重新定义cochlea模型, 使其包含降采样操作
         cochlea = Model(audio_in, cochlea_out)
+        # 将cochlea模型的输出连接到ihc模型, ihc模型的输出再连接到anf模型。
         # IHC
         ihc = ihc(cochlea.layers[-1].get_output_at(-1))
         # ANF
